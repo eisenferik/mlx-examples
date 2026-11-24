@@ -133,6 +133,7 @@ def log_mel_spectrogram(
     audio: Union[str, np.ndarray],
     n_mels: int = 80,
     padding: int = 0,
+    block_frames: int = 6000,
 ):
     """
     Compute the log-Mel spectrogram of
@@ -148,6 +149,9 @@ def log_mel_spectrogram(
     padding: int
         Number of zero samples to pad to the right
 
+    block_frames: int
+        Number of frames computed at a time
+
     Returns
     -------
     mx.array, shape = (80, n_frames)
@@ -155,19 +159,39 @@ def log_mel_spectrogram(
     """
     if isinstance(audio, str):
         audio = load_audio(audio)
-    elif not isinstance(audio, mx.array):
-        audio = mx.array(audio)
+    audio = np.asarray(audio, dtype=np.float32)
 
-    if padding > 0:
-        audio = mx.pad(audio, (0, padding))
+    # Computing the STFT of the whole input at once needs over ten times the size of
+    # the resulting mel; blocks keep that bounded. Frames match the whole-input STFT:
+    # reflect padding of N_FFT // 2 on both sides and the last frame dropped.
+    samples = audio.shape[0]
+    length = samples + padding
+    edge = N_FFT // 2
     window = hanning(N_FFT)
-    freqs = stft(audio, window, nperseg=N_FFT, noverlap=HOP_LENGTH)
-    magnitudes = freqs[:-1, :].abs().square()
-
     filters = mel_filters(n_mels)
-    mel_spec = magnitudes @ filters.T
-
-    log_spec = mx.maximum(mel_spec, 1e-10).log10()
-    log_spec = mx.maximum(log_spec, log_spec.max() - 8.0)
-    log_spec = (log_spec + 4.0) / 4.0
-    return log_spec
+    blocks = []
+    peak = None
+    count = length // HOP_LENGTH
+    for first in range(0, count, block_frames):
+        last = min(count, first + block_frames)
+        padded = np.arange(first * HOP_LENGTH, (last - 1) * HOP_LENGTH + N_FFT)
+        index = np.where(
+            padded < edge,
+            edge - padded,
+            np.where(padded < edge + length, padded - edge, 2 * length + edge - 2 - padded),
+        )
+        piece = np.zeros(padded.shape[0], dtype=np.float32)
+        heard = index < samples
+        piece[heard] = audio[index[heard]]
+        frames = mx.as_strided(
+            mx.array(piece), shape=[last - first, N_FFT], strides=[HOP_LENGTH, 1]
+        )
+        magnitudes = mx.fft.rfft(frames * window).abs().square()
+        block = mx.maximum(magnitudes @ filters.T, 1e-10).log10()
+        peak = block.max() if peak is None else mx.maximum(peak, block.max())
+        mx.eval(block, peak)
+        blocks.append(block)
+    for i, block in enumerate(blocks):
+        blocks[i] = (mx.maximum(block, peak - 8.0) + 4.0) / 4.0
+        mx.eval(blocks[i])
+    return mx.concatenate(blocks)

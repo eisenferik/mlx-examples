@@ -459,6 +459,34 @@ class TestAudio(unittest.TestCase):
         self.assertTrue(mels.shape, [80, 400])
         self.assertTrue(mels.dtype, mx.float32)
 
+    def test_block_wise_mel_spec_matches_whole_input(self):
+        def whole(data, n_mels, padding):
+            data = mx.pad(mx.array(data), (0, padding)) if padding else mx.array(data)
+            freqs = audio.stft(
+                data,
+                audio.hanning(audio.N_FFT),
+                nperseg=audio.N_FFT,
+                noverlap=audio.HOP_LENGTH,
+            )
+            spec = freqs[:-1, :].abs().square() @ audio.mel_filters(n_mels).T
+            spec = mx.maximum(spec, 1e-10).log10()
+            return (mx.maximum(spec, spec.max() - 8.0) + 4.0) / 4.0
+
+        rng = np.random.default_rng(7)
+        for seconds in (0.02, 1.37):
+            for padding in (0, 480000):
+                data = (rng.standard_normal(round(seconds * 16000)) * 0.1).astype(
+                    np.float32
+                )
+                expected = np.array(whole(data, 128, padding))
+                actual = np.array(
+                    audio.log_mel_spectrogram(
+                        data, n_mels=128, padding=padding, block_frames=7
+                    )
+                )
+                self.assertEqual(actual.shape, expected.shape)
+                np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-4)
+
 
 if __name__ == "__main__":
     unittest.main()
