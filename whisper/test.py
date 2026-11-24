@@ -11,6 +11,7 @@ import mlx_whisper
 import mlx_whisper.audio as audio
 import mlx_whisper.decoding as decoding
 import mlx_whisper.load_models as load_models
+import mlx_whisper.whisper as whisper
 import numpy as np
 import torch
 from convert import convert, load_torch_model, quantize
@@ -486,6 +487,38 @@ class TestAudio(unittest.TestCase):
                 )
                 self.assertEqual(actual.shape, expected.shape)
                 np.testing.assert_allclose(actual, expected, rtol=0, atol=1e-4)
+
+
+
+class TestAttention(unittest.TestCase):
+    def test_matches_softmax_attention_with_unequal_query_key_lengths(self):
+        def reference(q, k, v, n_head, mask):
+            n_batch, n_ctx, n_state = q.shape
+            scale = (n_state // n_head) ** -0.25
+            q = q.reshape(*q.shape[:2], n_head, -1).transpose(0, 2, 1, 3) * scale
+            k = k.reshape(*k.shape[:2], n_head, -1).transpose(0, 2, 3, 1) * scale
+            v = v.reshape(*v.shape[:2], n_head, -1).transpose(0, 2, 1, 3)
+            qk = q @ k
+            if mask is not None:
+                qk = qk + mask[:n_ctx, :n_ctx]
+            w = mx.softmax(qk, axis=-1, precise=True)
+            return (w @ v).transpose(0, 2, 1, 3).reshape(n_batch, n_ctx, n_state)
+
+        attention = whisper.MultiHeadAttention(64, 4)
+        causal = mx.array(np.where(np.triu(np.ones((5, 5)), 1), -np.inf, 0.0))
+        rng = np.random.default_rng(321)
+        # cross attention, causal self-attention, one query against a kv cache
+        for query_length, key_length, mask in ((3, 5, None), (3, 3, causal), (1, 5, None)):
+            q, k, v = (
+                mx.array(rng.normal(size=(2, n, 64)).astype(np.float32))
+                for n in (query_length, key_length, key_length)
+            )
+            actual, qk = attention.qkv_attention(q, k, v, mask)
+            expected = reference(q, k, v, 4, mask)
+            np.testing.assert_allclose(
+                np.array(actual), np.array(expected), rtol=1e-5, atol=1e-5
+            )
+            self.assertIsNone(qk)
 
 
 if __name__ == "__main__":

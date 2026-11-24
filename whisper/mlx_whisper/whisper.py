@@ -71,20 +71,18 @@ class MultiHeadAttention(nn.Module):
         return self.out(wv), (k, v), qk
 
     def qkv_attention(self, q, k, v, mask=None):
+        # The fused kernel does not return attention weights, so qk is None and
+        # word-level timestamps, which read the cross-attention weights, are unavailable.
         n_batch, n_ctx, n_state = q.shape
-        scale = (n_state // self.n_head) ** -0.25
-        q = q.reshape(*q.shape[:2], self.n_head, -1).transpose(0, 2, 1, 3) * scale
-        k = k.reshape(*k.shape[:2], self.n_head, -1).transpose(0, 2, 3, 1) * scale
+        q = q.reshape(*q.shape[:2], self.n_head, -1).transpose(0, 2, 1, 3)
+        k = k.reshape(*k.shape[:2], self.n_head, -1).transpose(0, 2, 1, 3)
         v = v.reshape(*v.shape[:2], self.n_head, -1).transpose(0, 2, 1, 3)
-
-        qk = q @ k
-        if mask is not None:
-            qk = qk + mask[:n_ctx, :n_ctx]
-
-        w = mx.softmax(qk, axis=-1, precise=True)
-        out = (w @ v).transpose(0, 2, 1, 3)
-        out = out.reshape(n_batch, n_ctx, n_state)
-        return out, qk
+        mask = mask[:n_ctx, :n_ctx] if mask is not None else None
+        out = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=(n_state // self.n_head) ** -0.5, mask=mask
+        )
+        out = out.transpose(0, 2, 1, 3).reshape(n_batch, n_ctx, n_state)
+        return out, None
 
 
 class ResidualAttentionBlock(nn.Module):
